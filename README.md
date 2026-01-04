@@ -12,6 +12,7 @@ Based on an observation from a Cursor Community thread: [Lost access to 5-7 Agen
 
 - ✅ **Copy/Move workspaces** with full chat history preservation
 - ✅ **Merge chat histories** from duplicate workspace storage entries
+- ✅ **Export/Import** for cross-machine synchronization (NEW!)
 - ✅ **Database lock checking** for safe operations
 - ✅ **Cross-platform support** (Windows, macOS, Linux)
 - ✅ **Interactive TUI** for easy usage
@@ -82,6 +83,65 @@ In rare cases you may end up with **multiple** `workspaceStorage/<id>` entries t
 
 Note: `merge` is **not** a migration. It does not move/copy your workspace folder and does not change its path. It only consolidates duplicate `workspaceStorage` state for the same folder URI.
 
+## Export/Import (commands)
+
+For **cross-machine synchronization** of chat history, use `export` and `import`:
+
+### Export (READ-ONLY)
+
+Exports all workspace chat data to a portable JSON file. This operation is **strictly read-only** - it never writes to any database.
+
+```powershell
+# Export all workspaces
+python -m cursor_mover export --output "./cursor_chats_export.json"
+
+# Export only a specific workspace
+python -m cursor_mover export --output "./my_project_chats.json" --path "C:\Projects\MyProject"
+```
+
+The export file includes:
+- Machine name (for identification)
+- All `ItemTable` and `cursorDiskKV` entries
+- Composer/chat metadata with timestamps
+- Export timestamp
+
+### Import (with backup)
+
+Imports chat data from an export file with **intelligent merge**:
+- **Always creates a timestamped backup** before modifying any database
+- **Skips existing keys** (does not overwrite local data)
+- **Merges composer data by ID**, keeping the newest version by timestamp
+
+```powershell
+# Import all workspaces (with confirmation prompt)
+python -m cursor_mover import --input "./cursor_chats_export.json"
+
+# Import only a specific workspace
+python -m cursor_mover import --input "./cursor_chats_export.json" --path "C:\Projects\MyProject"
+
+# Dry run - see what would be imported without making changes
+python -m cursor_mover import --input "./cursor_chats_export.json" --dry-run
+```
+
+### Cross-Machine Sync Workflow
+
+1. **On source machine (e.g., "rog"):**
+   ```powershell
+   python -m cursor_mover export --output "./shared/cursor_chats.json"
+   git add ./shared/cursor_chats.json && git commit -m "Export chats" && git push
+   ```
+
+2. **On destination machine (e.g., "gram"):**
+   ```powershell
+   git pull
+   python -m cursor_mover import --input "./shared/cursor_chats.json"
+   ```
+
+**Important notes:**
+- Close Cursor before running import (to avoid locked databases)
+- Workspaces must exist locally (opened in Cursor at least once) for import to work
+- Backup files are created as `state.vscdb.preimport-<timestamp>` next to the original
+
 ## Doctor (command)
 
 `doctor` prints how Cursor maps a workspace folder to `workspaceStorage/<id>`:
@@ -135,7 +195,7 @@ Interactive TUI (only when stdin/stdout are TTY):
 python -m cursor_mover
 ```
 
-TUI includes `copy`, `move`, `doctor`, and `merge`.
+TUI includes `copy`, `move`, `doctor`, `merge`, `export`, and `import`.
 
 Note: `copy` / `move` / `merge` require that the workspace folder was opened in Cursor at least once (so it has an existing `workspaceStorage/<id>` entry). If not, open the folder in Cursor and retry.
 

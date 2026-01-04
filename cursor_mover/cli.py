@@ -13,6 +13,12 @@ from pathlib import Path
 from cursor_mover.console import error, info, success, warn
 from cursor_mover.copying import CopyStats, copy_tree_with_progress
 from cursor_mover.cursor_paths import default_cursor_user_dir
+from cursor_mover.export_import import (
+    ExportResult,
+    ImportResult,
+    export_workspace_chats,
+    import_workspace_chats,
+)
 from cursor_mover.locks import WorkspaceStorageLockedError, assert_paths_unlocked
 from cursor_mover.merge import MergeResult, merge_workspace_state
 from cursor_mover.prompts import is_interactive, prompt_choice, prompt_yes_no
@@ -64,6 +70,61 @@ def main(argv: list[str] | None = None) -> int:
             "--delete-sources",
             action="store_true",
             help="Delete merged source workspaceStorage folders after successful merge.",
+        )
+
+        # Export command - READ-ONLY operation for cross-machine sync
+        export_cmd = sub.add_parser(
+            "export",
+            help="Export workspace chat data to a portable JSON file (READ-ONLY, for cross-machine sync).",
+        )
+        export_cmd.add_argument(
+            "--output",
+            "-o",
+            type=Path,
+            required=True,
+            help="Output file path for the export JSON.",
+        )
+        export_cmd.add_argument(
+            "--path",
+            type=Path,
+            default=None,
+            help="Export only this specific workspace folder (default: export all workspaces).",
+        )
+        export_cmd.add_argument(
+            "--unsafe-db",
+            "-UnsafeDB",
+            dest="unsafe_db",
+            action="store_true",
+            help="Skip lock checks (may export inconsistent data).",
+        )
+
+        # Import command - writes to local DBs with backup
+        import_cmd = sub.add_parser(
+            "import",
+            help="Import workspace chat data from an export file (creates backup before modifying).",
+        )
+        import_cmd.add_argument(
+            "--input",
+            "-i",
+            type=Path,
+            required=True,
+            help="Input file path of the export JSON.",
+        )
+        import_cmd.add_argument(
+            "--path",
+            type=Path,
+            default=None,
+            help="Import only data for this specific workspace folder (default: import all).",
+        )
+        import_cmd.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Show what would be imported without making changes.",
+        )
+        import_cmd.add_argument(
+            "--yes",
+            action="store_true",
+            help="Auto-confirm interactive prompts.",
         )
 
         copy_cmd = sub.add_parser("copy", help="Copy a workspace folder and clone its Cursor chat history (mode C).")
@@ -157,6 +218,23 @@ def main(argv: list[str] | None = None) -> int:
                     path=args.path,
                     assume_yes=args.yes,
                     delete_sources=args.delete_sources,
+                )
+                return 0
+            if args.cmd == "export":
+                _cmd_export(
+                    cursor_user_dir=cursor_user_dir,
+                    output_path=args.output,
+                    folder_filter=args.path,
+                    unsafe_db=args.unsafe_db,
+                )
+                return 0
+            if args.cmd == "import":
+                _cmd_import(
+                    cursor_user_dir=cursor_user_dir,
+                    input_path=args.input,
+                    folder_filter=args.path,
+                    dry_run=args.dry_run,
+                    assume_yes=args.yes,
                 )
                 return 0
             if args.cmd == "copy":
@@ -306,6 +384,93 @@ def _cmd_merge(
         for src_db in result.sources:
             _robust_rmtree(src_db.parent)
         info("Deleted merged source workspaceStorage folders.")
+
+
+def _cmd_export(
+    *,
+    cursor_user_dir: Path,
+    output_path: Path,
+    folder_filter: Path | None,
+    unsafe_db: bool,
+) -> None:
+    """Export workspace chat data to a portable JSON file (READ-ONLY operation)."""
+    info("Exporting workspace chat data...")
+    info("NOTE: This is a READ-ONLY operation - no databases will be modified.")
+    
+    if folder_filter:
+        folder_filter = folder_filter.resolve()
+        info(f"Filtering to workspace: {folder_filter}")
+    
+    result = export_workspace_chats(
+        output_path=output_path,
+        cursor_user_dir=cursor_user_dir,
+        folder_filter=folder_filter,
+        unsafe_db=unsafe_db,
+    )
+    
+    success("Export complete!")
+    info(f"Output file: {result.output_file}")
+    info(f"Source machine: {result.machine_name}")
+    info(f"Workspaces exported: {result.workspaces_exported}")
+    info(f"Total ItemTable keys: {result.total_itemtable_keys}")
+    info(f"Total cursorDiskKV keys: {result.total_cursordiskkv_keys}")
+    info(f"Total composer IDs: {result.total_composer_ids}")
+    info(f"Export timestamp: {result.export_timestamp}")
+
+
+def _cmd_import(
+    *,
+    cursor_user_dir: Path,
+    input_path: Path,
+    folder_filter: Path | None,
+    dry_run: bool,
+    assume_yes: bool,
+) -> None:
+    """Import workspace chat data from an export file with intelligent merge."""
+    input_path = input_path.resolve()
+    
+    if dry_run:
+        info("DRY RUN - no changes will be made.")
+    else:
+        info("Importing workspace chat data...")
+        info("NOTE: A timestamped backup will be created before any database is modified.")
+    
+    if folder_filter:
+        folder_filter = folder_filter.resolve()
+        info(f"Filtering to workspace: {folder_filter}")
+    
+    if not dry_run and not assume_yes and is_interactive():
+        warn("This will modify local Cursor databases.")
+        warn("A backup will be created, but proceed with caution.")
+        if not prompt_yes_no("Continue with import?", default=True):
+            info("Import cancelled.")
+            return
+    
+    result = import_workspace_chats(
+        input_path=input_path,
+        cursor_user_dir=cursor_user_dir,
+        folder_filter=folder_filter,
+        dry_run=dry_run,
+    )
+    
+    if dry_run:
+        success("Dry run complete - no changes made.")
+    else:
+        success("Import complete!")
+    
+    info(f"Input file: {result.input_file}")
+    info(f"Source machine: {result.source_machine}")
+    info(f"Workspaces processed: {result.workspaces_processed}")
+    info(f"Workspaces updated: {result.workspaces_updated}")
+    info(f"Workspaces skipped: {result.workspaces_skipped}")
+    info(f"ItemTable keys inserted: {result.itemtable_keys_inserted}")
+    info(f"cursorDiskKV keys inserted: {result.cursordiskkv_keys_inserted}")
+    info(f"Composer IDs: {result.composer_ids_before} -> {result.composer_ids_after}")
+    
+    if result.backup_files:
+        info("Backup files created:")
+        for backup in result.backup_files:
+            info(f"  - {backup}")
 
 
 def _require_unlocked_for_merge(dst_db: Path, src_dbs: list[Path]) -> None:
@@ -788,6 +953,24 @@ def _tui_config_to_argv(cfg) -> list[str]:
             argv.append("--yes")
         if cfg.delete_sources:
             argv.append("--delete-sources")
+        return argv
+
+    if cfg.cmd == "export":
+        argv += ["--output", str(cfg.export_output)]
+        if cfg.src is not None:
+            argv += ["--path", str(cfg.src)]
+        if cfg.unsafe_db:
+            argv.append("-UnsafeDB")
+        return argv
+
+    if cfg.cmd == "import":
+        argv += ["--input", str(cfg.import_input)]
+        if cfg.src is not None:
+            argv += ["--path", str(cfg.src)]
+        if cfg.dry_run:
+            argv.append("--dry-run")
+        if cfg.assume_yes:
+            argv.append("--yes")
         return argv
 
     argv += ["--src", str(cfg.src), "--dst", str(cfg.dst)]
