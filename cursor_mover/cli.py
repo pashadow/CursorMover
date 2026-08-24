@@ -25,6 +25,7 @@ from cursor_mover.global_chat_merge import (
     list_source_chat_counts,
     match_source_to_local_workspaces,
     merge_global_composer_history,
+    rekey_local_workspace_id,
 )
 from cursor_mover.locks import WorkspaceStorageLockedError, assert_paths_unlocked
 from cursor_mover.merge import MergeResult, merge_workspace_state
@@ -472,6 +473,20 @@ def _cmd_merge(
     info(f"Composer entries: {result.composer_ids_before} -> {result.composer_ids_after}")
     info(f"Backup: {result.backup_path}")
 
+    # * `state.vscdb` only holds a legacy per-workspace index; real chat sessions live in
+    #   globalStorage keyed by workspace id, so re-point those from each source id to dst_id too.
+    global_rekeyed_total = 0
+    for src_db in sources:
+        rekey_result = rekey_local_workspace_id(
+            cursor_user_dir=cursor_user_dir,
+            old_workspace_id=src_db.parent.name,
+            new_workspace_id=dst_id,
+            folder_uri=folder_uri,
+        )
+        global_rekeyed_total += rekey_result.sessions_rekeyed
+    if global_rekeyed_total:
+        info(f"Re-pointed {global_rekeyed_total} real chat session(s) from other workspace id(s) in globalStorage.")
+
     if delete_sources:
         if not assume_yes and is_interactive():
             if not prompt_yes_no("Delete merged source workspaceStorage folders?", default=False):
@@ -546,13 +561,16 @@ def _cmd_list_chats(*, source_user_dir: Path) -> None:
     info(f"Source User dir: {source_user_dir}")
     info(f"Workspaces: {len(counts)}")
     info("")
+    info("real / total  folder")
 
     for c in counts:
-        info(f"{c.session_count:5d}  {c.display_path}")
+        info(f"{c.real_session_count:4d} / {c.session_count:<4d}  {c.display_path}")
 
-    total = sum(c.session_count for c in counts)
+    total_real = sum(c.real_session_count for c in counts)
+    total_all = sum(c.session_count for c in counts)
     info("")
-    info(f"Total real chat sessions: {total}")
+    info(f"Total real chat sessions (with messages): {total_real}")
+    info(f"Total composerHeaders rows (including empty placeholders): {total_all}")
 
 
 def _cmd_sync_chats(

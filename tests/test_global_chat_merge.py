@@ -13,6 +13,7 @@ from cursor_mover.global_chat_merge import (
     list_source_chat_counts,
     match_source_to_local_workspaces,
     merge_global_composer_history,
+    rekey_local_workspace_id,
 )
 
 
@@ -251,6 +252,86 @@ class MergeGlobalComposerHistoryTest(unittest.TestCase):
                 con.close()
 
 
+class RekeyLocalWorkspaceIdTest(unittest.TestCase):
+    def test_repoints_sessions_to_new_id_and_rewrites_identifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cursor_user_dir = Path(tmp).resolve() / "User"
+            _make_global_storage(
+                cursor_user_dir,
+                composer_headers=[
+                    ("c1", "old-id", 100, 200, 0, 0, 0, 0, _header_value("c1", "old-id")),
+                    ("c2", "old-id", 100, 200, 0, 0, 0, 0, _header_value("c2", "old-id")),
+                    ("c3", "unrelated-id", 100, 200, 0, 0, 0, 0, _header_value("c3", "unrelated-id")),
+                ],
+                disk_kv={"composerData:c1": json.dumps({"composerId": "c1"})},
+            )
+
+            result = rekey_local_workspace_id(
+                cursor_user_dir=cursor_user_dir,
+                old_workspace_id="old-id",
+                new_workspace_id="new-id",
+                folder_uri="file:///Users/someuser/Documents/projects/Foo",
+            )
+
+            self.assertEqual(result.sessions_rekeyed, 2)
+            self.assertIsNotNone(result.backup_file)
+
+            con = sqlite3.connect((cursor_user_dir / "globalStorage" / "state.vscdb").as_posix())
+            try:
+                cur = con.cursor()
+                cur.execute("SELECT COUNT(*) FROM composerHeaders WHERE workspaceId='old-id'")
+                self.assertEqual(cur.fetchone()[0], 0)
+
+                cur.execute("SELECT composerId, value FROM composerHeaders WHERE workspaceId='new-id'")
+                rows = dict(cur.fetchall())
+                self.assertEqual(set(rows.keys()), {"c1", "c2"})
+                for value in rows.values():
+                    payload = json.loads(value)
+                    self.assertEqual(payload["workspaceIdentifier"]["id"], "new-id")
+                    self.assertEqual(
+                        payload["workspaceIdentifier"]["uri"]["external"],
+                        "file:///Users/someuser/Documents/projects/Foo",
+                    )
+
+                # unrelated session and cursorDiskKV content untouched
+                cur.execute("SELECT workspaceId FROM composerHeaders WHERE composerId='c3'")
+                self.assertEqual(cur.fetchone()[0], "unrelated-id")
+                cur.execute("SELECT COUNT(*) FROM cursorDiskKV")
+                self.assertEqual(cur.fetchone()[0], 1)
+            finally:
+                con.close()
+
+    def test_dry_run_makes_no_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cursor_user_dir = Path(tmp).resolve() / "User"
+            _make_global_storage(
+                cursor_user_dir,
+                composer_headers=[
+                    ("c1", "old-id", 100, 200, 0, 0, 0, 0, _header_value("c1", "old-id")),
+                ],
+                disk_kv={},
+            )
+
+            result = rekey_local_workspace_id(
+                cursor_user_dir=cursor_user_dir,
+                old_workspace_id="old-id",
+                new_workspace_id="new-id",
+                folder_uri="file:///Users/someuser/Documents/projects/Foo",
+                dry_run=True,
+            )
+
+            self.assertEqual(result.sessions_rekeyed, 1)
+            self.assertIsNone(result.backup_file)
+
+            con = sqlite3.connect((cursor_user_dir / "globalStorage" / "state.vscdb").as_posix())
+            try:
+                cur = con.cursor()
+                cur.execute("SELECT COUNT(*) FROM composerHeaders WHERE workspaceId='old-id'")
+                self.assertEqual(cur.fetchone()[0], 1)
+            finally:
+                con.close()
+
+
 class ListSourceChatCountsTest(unittest.TestCase):
     def test_includes_zero_count_folders_and_sorts_descending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -276,12 +357,37 @@ class ListSourceChatCountsTest(unittest.TestCase):
 
             self.assertEqual(len(results), 3)  # empty-window excluded
             self.assertEqual([r.session_count for r in results], [2, 0, 0])
+            self.assertEqual([r.real_session_count for r in results], [0, 0, 0])  # no bubbles anywhere
             self.assertEqual(results[0].workspace_id, "busy-id")
             self.assertEqual(results[0].display_path, "d:/projects/Busy")
 
             multiroot = next(r for r in results if r.workspace_id == "multiroot-id")
             self.assertIsNone(multiroot.folder_uri)
             self.assertIn("multi-root workspace", multiroot.display_path)
+
+    def test_real_session_count_excludes_sessions_with_no_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp).resolve() / "source"
+            _make_global_storage(
+                source_root,
+                composer_headers=[
+                    ("c1", "ws-id", 100, 100, 0, 0, 0, 0, _header_value("c1", "ws-id")),
+                    ("c2", "ws-id", 100, 100, 0, 0, 0, 0, _header_value("c2", "ws-id")),
+                    ("c3", "ws-id", 100, 100, 0, 0, 0, 0, _header_value("c3", "ws-id")),
+                ],
+                disk_kv={
+                    "bubbleId:c1:bubble-a": json.dumps({"bubbleId": "bubble-a"}),
+                    "bubbleId:c1:bubble-b": json.dumps({"bubbleId": "bubble-b"}),
+                    # c2 has no bubbles at all (empty placeholder); c3 likewise.
+                },
+            )
+            _make_workspace_storage_entry(source_root, "ws-id", {"folder": "file:///d%3A/projects/Foo"})
+
+            results = list_source_chat_counts(source_root)
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].session_count, 3)
+            self.assertEqual(results[0].real_session_count, 1)
 
     def test_raises_when_no_global_storage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -107,6 +107,11 @@ This is the only way to get real counts - an export JSON's per-workspace counts 
 `list-export` above). `list-chats` reads `globalStorage` on the source machine directly, the same way
 `sync-chats` does, so the numbers match exactly what `sync-chats` would merge.
 
+Output shows two numbers per folder, `real / total`. Cursor creates empty "head" composer sessions
+alongside real ones (auto-created placeholders on first open, or empty draft companions with no
+messages) - `total` counts every row `sync-chats` would copy, while `real` only counts sessions that
+actually have at least one message, matching what Cursor's own UI shows.
+
 ```bash
 python -m cursor_mover sync-chats --source-user-dir "/Volumes/DRIVE/Cursor/User"
 

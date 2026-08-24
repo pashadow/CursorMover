@@ -24,18 +24,19 @@ from cursor_mover.workspace_uri import folder_uri_basename, folder_uri_display_p
 
 @dataclass(frozen=True, slots=True)
 class SourceWorkspaceChatCount:
-    """Real chat session count for one source workspace, read straight from globalStorage.
+    """Chat session counts for one source workspace, read straight from globalStorage.
 
     An export JSON file cannot answer "how many real chats does this folder
     have" - it never captures `globalStorage` (see module docstring). This
-    reads `composerHeaders` on the source machine directly instead, so the
-    counts here are authoritative.
+    reads `composerHeaders`/`cursorDiskKV` on the source machine directly
+    instead, so the counts here are authoritative.
     """
 
     workspace_id: str
     folder_uri: str | None  # None for multi-root .code-workspace entries
     workspace_config_uri: str | None
-    session_count: int
+    session_count: int  # every composerHeaders row, including empty ones (see real_session_count)
+    real_session_count: int  # sessions that actually have at least one message
 
     @property
     def display_path(self) -> str:
@@ -45,12 +46,18 @@ class SourceWorkspaceChatCount:
 
 
 def list_source_chat_counts(source_cursor_user_dir: Path) -> list[SourceWorkspaceChatCount]:
-    """Lists every source workspace with its real chat session count.
+    """Lists every source workspace with its chat session counts.
 
     Includes workspaces with 0 sessions, so it answers "how many real chats
     does each folder have" directly - unlike an export JSON's per-workspace
     `composer.composerData` index, which is frequently 0 even for folders
     with substantial real history (see `sync-chats` docs).
+
+    Cursor creates empty "head" composerHeaders rows alongside real ones
+    (auto-created placeholders on first open, or empty draft companions) -
+    these have no messages and Cursor's own UI doesn't show them, so
+    `session_count` (every row) can overcount what a user would actually see.
+    `real_session_count` only counts sessions with at least one message.
     """
     source_db = source_cursor_user_dir / "globalStorage" / "state.vscdb"
     if not source_db.exists():
@@ -59,10 +66,21 @@ def list_source_chat_counts(source_cursor_user_dir: Path) -> list[SourceWorkspac
     con = sqlite3.connect(f"file:{source_db.as_posix()}?mode=ro", uri=True)
     try:
         cur = con.cursor()
-        cur.execute("SELECT workspaceId, COUNT(*) FROM composerHeaders GROUP BY workspaceId")
-        counts_by_id = dict(cur.fetchall())
+        cur.execute("SELECT composerId, workspaceId FROM composerHeaders")
+        composer_workspace = cur.fetchall()
+
+        # * bubbleId keys are formatted "bubbleId:<composerId>:<bubbleId>".
+        cur.execute("SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
+        composer_ids_with_messages = {key.split(":", 2)[1] for (key,) in cur.fetchall()}
     finally:
         con.close()
+
+    total_counts: dict[str, int] = {}
+    real_counts: dict[str, int] = {}
+    for composer_id, workspace_id in composer_workspace:
+        total_counts[workspace_id] = total_counts.get(workspace_id, 0) + 1
+        if composer_id in composer_ids_with_messages:
+            real_counts[workspace_id] = real_counts.get(workspace_id, 0) + 1
 
     results: list[SourceWorkspaceChatCount] = []
     for entry in iter_workspace_storage_entries(source_cursor_user_dir):
@@ -74,11 +92,12 @@ def list_source_chat_counts(source_cursor_user_dir: Path) -> list[SourceWorkspac
                 workspace_id=entry.workspace_id,
                 folder_uri=entry.folder_uri,
                 workspace_config_uri=entry.workspace_config_uri,
-                session_count=counts_by_id.get(entry.workspace_id, 0),
+                session_count=total_counts.get(entry.workspace_id, 0),
+                real_session_count=real_counts.get(entry.workspace_id, 0),
             )
         )
 
-    return sorted(results, key=lambda r: r.session_count, reverse=True)
+    return sorted(results, key=lambda r: (r.real_session_count, r.session_count), reverse=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +304,78 @@ def _folder_uri_to_fspath(folder_uri: str) -> str:
 
     parsed = urlparse(folder_uri)
     return unquote(parsed.path)
+
+
+@dataclass(frozen=True, slots=True)
+class RekeyResult:
+    """Summary of re-pointing composer sessions from one local workspace id to another."""
+
+    sessions_rekeyed: int
+    backup_file: Path | None
+    dry_run: bool = False
+
+
+def rekey_local_workspace_id(
+    *,
+    cursor_user_dir: Path,
+    old_workspace_id: str,
+    new_workspace_id: str,
+    folder_uri: str,
+    dry_run: bool = False,
+) -> RekeyResult:
+    """Re-points existing composer sessions from an old local workspace id to a new one.
+
+    Cursor computes a workspace id from the folder path plus filesystem
+    metadata (e.g. creation time). If that metadata changes for a folder that
+    hasn't moved - a common trigger is copying/re-extracting the folder onto
+    a new machine - Cursor starts using a *new* id for it, and every session
+    merged or created under the old id becomes invisible in the UI even
+    though the data is still there. This re-points those sessions to the new
+    id in place, updating the embedded `workspaceIdentifier` too.
+
+    Unlike `merge_global_composer_history`, this updates rows rather than
+    copying them, since old and new id both live in the same database - and
+    it never touches `cursorDiskKV` (composerData/bubbles), since those are
+    keyed by composerId, not workspace id, so they need no change.
+    """
+    db_path = cursor_user_dir / "globalStorage" / "state.vscdb"
+    if not db_path.exists():
+        raise FileNotFoundError(f"globalStorage database not found: {db_path}")
+
+    lock_paths = [db_path, db_path.with_name(db_path.name + "-wal"), db_path.with_name(db_path.name + "-shm")]
+    assert_paths_unlocked([p for p in lock_paths if p.exists()])
+
+    backup_file: Path | None = None
+    if dry_run:
+        con = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+    else:
+        backup_file = _create_timestamped_backup(db_path)
+        con = sqlite3.connect(db_path.as_posix())
+
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT composerId, value FROM composerHeaders WHERE workspaceId=?", (old_workspace_id,))
+        rows = cur.fetchall()
+
+        if not dry_run:
+            for composer_id, value in rows:
+                new_value = _rewrite_workspace_identifier(
+                    value, new_workspace_id=new_workspace_id, new_folder_uri=folder_uri
+                )
+                cur.execute(
+                    "UPDATE composerHeaders SET workspaceId=?, value=? WHERE composerId=?",
+                    (new_workspace_id, new_value, composer_id),
+                )
+
+            check = cur.execute("PRAGMA integrity_check").fetchone()
+            if not check or check[0] != "ok":
+                con.rollback()
+                raise RuntimeError(f"SQLite integrity_check failed: {check[0] if check else 'unknown'}")
+            con.commit()
+    finally:
+        con.close()
+
+    return RekeyResult(sessions_rekeyed=len(rows), backup_file=backup_file, dry_run=dry_run)
 
 
 def merge_global_composer_history(
