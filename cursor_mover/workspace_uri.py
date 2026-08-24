@@ -45,6 +45,19 @@ def path_to_folder_uri(path: Path) -> str:
     return "file://" + quote(posix_path, safe="/")
 
 
+def folder_uri_basename(folder_uri: str) -> str:
+    """Returns the last path segment of a folder URI, independent of source OS.
+
+    Works for URIs produced on either Windows or POSIX, since the encoded path
+    is always slash-separated regardless of which platform wrote it (e.g.
+    `file:///c%3A/Users/x/Projects/Foo` -> "Foo",
+    `file:///Users/x/Documents/Foo` -> "Foo").
+    """
+    parsed = urlparse(folder_uri)
+    raw_path = unquote(parsed.path).rstrip("/")
+    return raw_path.rsplit("/", 1)[-1]
+
+
 def folder_uri_to_path(folder_uri: str) -> Path:
     """Best-effort conversion from a `file:///...` folder URI to a filesystem path.
 

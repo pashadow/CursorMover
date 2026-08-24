@@ -30,6 +30,7 @@ from cursor_mover.workspace_storage import (
     workspace_db_paths,
     WorkspaceStorageEntry,
 )
+from cursor_mover.workspace_uri import folder_uri_basename
 
 
 EXPORT_FORMAT_VERSION = 1
@@ -63,6 +64,8 @@ class ImportResult:
     composer_ids_before: int
     composer_ids_after: int
     backup_files: tuple[Path, ...]
+    matched_by_name: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    ambiguous_name_matches: tuple[tuple[str, tuple[str, ...]], ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -436,15 +439,25 @@ def import_workspace_chats(
     if folder_filter is not None:
         from cursor_mover.workspace_uri import path_to_folder_uri
         filter_uri = path_to_folder_uri(folder_filter.resolve())
+        # The source machine's folder_uri is virtually never identical to the
+        # local one (different drive/home dir, or a different OS entirely),
+        # so also allow filtering by folder basename.
+        filter_basename = folder_filter.resolve().name
     else:
         filter_uri = None
-    
-    # Build a map of folder_uri -> local workspaceStorage entry
+        filter_basename = None
+
+    # Build a map of folder_uri -> local workspaceStorage entry, plus a
+    # basename -> [entries] index used as a fallback match for cross-machine
+    # imports where the exported folder_uri's absolute path never matches
+    # the local one (e.g. Windows -> macOS, different drive/home directory).
     local_entries: dict[str, WorkspaceStorageEntry] = {}
+    local_by_basename: dict[str, list[WorkspaceStorageEntry]] = {}
     for entry in iter_workspace_storage_entries(cursor_user_dir):
         if entry.folder_uri:
             local_entries[entry.folder_uri] = entry
-    
+            local_by_basename.setdefault(folder_uri_basename(entry.folder_uri), []).append(entry)
+
     workspaces_processed = 0
     workspaces_created = 0
     workspaces_updated = 0
@@ -454,21 +467,39 @@ def import_workspace_chats(
     composer_ids_before = 0
     composer_ids_after = 0
     backup_files: list[Path] = []
+    matched_by_name: list[tuple[str, str]] = []
+    ambiguous_name_matches: list[tuple[str, tuple[str, ...]]] = []
     
     for ws_data in workspaces_data:
         folder_uri = ws_data.get("folder_uri")
         if not folder_uri:
             continue
         
-        # Apply filter
+        # Apply filter (exact URI match, or fall back to folder basename
+        # match for cross-machine imports where paths never line up exactly)
         if filter_uri is not None and folder_uri != filter_uri:
-            continue
+            if filter_basename is None or folder_uri_basename(folder_uri) != filter_basename:
+                continue
         
         workspaces_processed += 1
         
-        # Check if we have a local entry for this folder_uri
+        # Check if we have a local entry for this exact folder_uri.
         local_entry = local_entries.get(folder_uri)
-        
+
+        # Fall back to matching by folder basename - the exact absolute path
+        # (drive letter, home directory, OS) almost never matches across
+        # machines, but the project folder name usually does.
+        if local_entry is None:
+            basename = folder_uri_basename(folder_uri)
+            candidates = local_by_basename.get(basename, [])
+            if len(candidates) == 1:
+                local_entry = candidates[0]
+                matched_by_name.append((folder_uri, local_entry.folder_uri or ""))
+            elif len(candidates) > 1:
+                ambiguous_name_matches.append(
+                    (basename, tuple(c.folder_uri or "" for c in candidates))
+                )
+
         if local_entry is None:
             if not create_missing_workspaces:
                 workspaces_skipped += 1
@@ -594,4 +625,6 @@ def import_workspace_chats(
         composer_ids_before=composer_ids_before,
         composer_ids_after=composer_ids_after,
         backup_files=tuple(backup_files),
+        matched_by_name=tuple(matched_by_name),
+        ambiguous_name_matches=tuple(ambiguous_name_matches),
     )

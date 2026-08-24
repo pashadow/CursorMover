@@ -19,6 +19,11 @@ from cursor_mover.export_import import (
     export_workspace_chats,
     import_workspace_chats,
 )
+from cursor_mover.global_chat_merge import (
+    find_orphaned_source_workspaces,
+    match_source_to_local_workspaces,
+    merge_global_composer_history,
+)
 from cursor_mover.locks import WorkspaceStorageLockedError, assert_paths_unlocked
 from cursor_mover.merge import MergeResult, merge_workspace_state
 from cursor_mover.prompts import is_interactive, prompt_choice, prompt_yes_no
@@ -122,6 +127,51 @@ def main(argv: list[str] | None = None) -> int:
             help="Show what would be imported without making changes.",
         )
         import_cmd.add_argument(
+            "--yes",
+            action="store_true",
+            help="Auto-confirm interactive prompts.",
+        )
+
+        sync_chats_cmd = sub.add_parser(
+            "sync-chats",
+            help=(
+                "Merge real chat/composer history (sessions + messages) from another machine's "
+                "Cursor User directory (e.g. a mounted drive or network copy) into local workspaces. "
+                "Unlike export/import, this reads globalStorage directly and carries over full "
+                "conversations, not just prompt text."
+            ),
+        )
+        sync_chats_cmd.add_argument(
+            "--source-user-dir",
+            type=Path,
+            required=True,
+            help="Path to the other machine's Cursor 'User' directory (must contain globalStorage/state.vscdb).",
+        )
+        sync_chats_cmd.add_argument(
+            "--path",
+            type=Path,
+            default=None,
+            help=(
+                "Restrict to this local workspace folder (default: sync all matching workspaces). "
+                "Required when using --source-workspace-id."
+            ),
+        )
+        sync_chats_cmd.add_argument(
+            "--source-workspace-id",
+            default=None,
+            help=(
+                "Merge one specific source workspace id directly into the folder given by --path, "
+                "bypassing folder-name matching. Use this for source workspaces with chat history "
+                "but no folder to match against (e.g. multi-root .code-workspace entries) - run "
+                "sync-chats normally first to see them listed."
+            ),
+        )
+        sync_chats_cmd.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Show what would be synced without making changes.",
+        )
+        sync_chats_cmd.add_argument(
             "--yes",
             action="store_true",
             help="Auto-confirm interactive prompts.",
@@ -233,6 +283,16 @@ def main(argv: list[str] | None = None) -> int:
                     cursor_user_dir=cursor_user_dir,
                     input_path=args.input,
                     folder_filter=args.path,
+                    dry_run=args.dry_run,
+                    assume_yes=args.yes,
+                )
+                return 0
+            if args.cmd == "sync-chats":
+                _cmd_sync_chats(
+                    cursor_user_dir=cursor_user_dir,
+                    source_user_dir=args.source_user_dir,
+                    folder_filter=args.path,
+                    source_workspace_id=args.source_workspace_id,
                     dry_run=args.dry_run,
                     assume_yes=args.yes,
                 )
@@ -418,6 +478,190 @@ def _cmd_export(
     info(f"Export timestamp: {result.export_timestamp}")
 
 
+def _cmd_sync_chats(
+    *,
+    cursor_user_dir: Path,
+    source_user_dir: Path,
+    folder_filter: Path | None,
+    source_workspace_id: str | None,
+    dry_run: bool,
+    assume_yes: bool,
+) -> None:
+    """Merge real chat/composer history from another machine's Cursor User directory."""
+    source_user_dir = source_user_dir.resolve()
+    source_global_db = source_user_dir / "globalStorage" / "state.vscdb"
+    if not source_global_db.exists():
+        raise FileNotFoundError(f"Source globalStorage database not found: {source_global_db}")
+
+    local_by_uri: dict[str, str] = {}
+    local_dupe_uris: set[str] = set()
+    for entry in iter_workspace_storage_entries(cursor_user_dir):
+        if entry.folder_uri:
+            if entry.folder_uri in local_by_uri:
+                local_dupe_uris.add(entry.folder_uri)
+                continue
+            local_by_uri[entry.folder_uri] = entry.workspace_id
+
+    if source_workspace_id is not None:
+        if folder_filter is None:
+            raise ValueError("--source-workspace-id requires --path (the local destination folder).")
+        target_uri = path_to_folder_uri(folder_filter.resolve())
+        if target_uri not in local_by_uri:
+            raise FileNotFoundError(
+                f"No local workspaceStorage entry for {folder_filter}. Open it in Cursor once first."
+            )
+        local_id = local_by_uri[target_uri]
+
+        if dry_run:
+            info("DRY RUN - no changes will be made.")
+        elif not assume_yes and is_interactive():
+            warn("This will modify the local Cursor globalStorage database.")
+            warn("A backup will be created, but proceed with caution.")
+            if not prompt_yes_no("Continue with sync?", default=True):
+                info("Sync cancelled.")
+                return
+
+        result = merge_global_composer_history(
+            source_cursor_user_dir=source_user_dir,
+            dest_cursor_user_dir=cursor_user_dir,
+            workspace_id_map={source_workspace_id: local_id},
+            dest_folder_uris={local_id: target_uri},
+            dry_run=dry_run,
+        )
+        verb = "Would insert" if dry_run else "Inserted"
+        success(
+            f"{verb} {result.headers_inserted} sessions, {result.composer_data_inserted} composer "
+            f"records, {result.bubbles_inserted} messages into {folder_filter} "
+            f"(skipped {result.headers_skipped_existing} already-present sessions)."
+        )
+        return
+
+    source_by_uri: dict[str, list[str]] = {}
+    for entry in iter_workspace_storage_entries(source_user_dir):
+        if entry.folder_uri:
+            source_by_uri.setdefault(entry.folder_uri, []).append(entry.workspace_id)
+
+    if folder_filter is not None:
+        target_uri = path_to_folder_uri(folder_filter.resolve())
+        if target_uri not in local_by_uri:
+            raise FileNotFoundError(
+                f"No local workspaceStorage entry for {folder_filter}. Open it in Cursor once first."
+            )
+        local_by_uri = {target_uri: local_by_uri[target_uri]}
+
+    if local_dupe_uris:
+        warn(
+            f"Skipping {len(local_dupe_uris)} folder(s) with duplicate local workspaceStorage entries; "
+            "run 'merge' on them first."
+        )
+
+    match = match_source_to_local_workspaces(source_by_uri, local_by_uri)
+
+    remaining_ambiguous = list(match.ambiguous)
+    if match.ambiguous and is_interactive() and not assume_yes:
+        remaining_ambiguous = []
+        for group in match.ambiguous:
+            info(
+                f"'{group.basename}': {len(group.source_ids)} source workspace(s) across "
+                f"{len(group.source_uris)} folder(s) on the source machine match more than one "
+                "local folder:"
+            )
+            for uri in group.source_uris:
+                info(f"    source: {uri}")
+            choices = {str(i + 1): uri for i, uri in enumerate(group.local_candidates)}
+            for key, uri in choices.items():
+                info(f"    [{key}] {uri}")
+
+            if not prompt_yes_no(
+                f"Merge all {len(group.source_ids)} of these into one local folder (optional)?",
+                default=False,
+            ):
+                remaining_ambiguous.append(group)
+                continue
+
+            choice_key = prompt_choice("Which local folder should they merge into?", choices, default="1")
+            chosen_local_id = local_by_uri[choices[choice_key]]
+            match.matched.setdefault(chosen_local_id, []).extend(group.source_ids)
+
+    if not match.matched:
+        info("No matching workspaces found to sync.")
+        return
+
+    info(f"Matched {len(match.matched)} local workspace(s) to sync chat history for.")
+
+    if dry_run:
+        info("DRY RUN - no changes will be made.")
+    elif not assume_yes and is_interactive():
+        warn("This will modify the local Cursor globalStorage database.")
+        warn("A backup will be created, but proceed with caution.")
+        if not prompt_yes_no("Continue with sync?", default=True):
+            info("Sync cancelled.")
+            return
+
+    local_id_to_uri = {v: k for k, v in local_by_uri.items()}
+    total_headers = total_composer_data = total_bubbles = 0
+    for local_id, source_ids in match.matched.items():
+        result = merge_global_composer_history(
+            source_cursor_user_dir=source_user_dir,
+            dest_cursor_user_dir=cursor_user_dir,
+            workspace_id_map={src_id: local_id for src_id in source_ids},
+            dest_folder_uris={local_id: local_id_to_uri[local_id]},
+            dry_run=dry_run,
+        )
+        total_headers += result.headers_inserted
+        total_composer_data += result.composer_data_inserted
+        total_bubbles += result.bubbles_inserted
+        info(
+            f"  {local_id_to_uri[local_id]}: +{result.headers_inserted} sessions, "
+            f"+{result.bubbles_inserted} messages "
+            f"(skipped {result.headers_skipped_existing} already-present sessions)"
+        )
+
+    if remaining_ambiguous:
+        warn(
+            f"{len(remaining_ambiguous)} folder name(s) matched multiple local candidates and were "
+            "skipped - use --path to target one directly, or re-run interactively to merge them:"
+        )
+        for group in remaining_ambiguous:
+            warn(f"  '{group.basename}' ({len(group.source_ids)} source workspace(s)):")
+            for uri in group.local_candidates:
+                warn(f"    {uri}")
+
+    if match.unmatched_source_uris:
+        info(
+            f"{len(match.unmatched_source_uris)} source workspace(s) have no local counterpart yet "
+            "(open the folder in Cursor on this machine once, then re-run):"
+        )
+        for uri in match.unmatched_source_uris:
+            info(f"  {uri}")
+
+    orphaned = find_orphaned_source_workspaces(source_user_dir)
+    if orphaned:
+        warn(
+            f"{len(orphaned)} source workspace(s) have chat history but no folder to match against "
+            "(likely multi-root .code-workspace entries) - merge manually with --source-workspace-id:"
+        )
+        for ws in orphaned:
+            warn(f"  id={ws.workspace_id}  sessions={ws.session_count}")
+            for name in ws.sample_session_names:
+                warn(f"      - {name}")
+            warn(
+                f"    python -m cursor_mover sync-chats --source-user-dir \"{source_user_dir}\" "
+                f"--source-workspace-id {ws.workspace_id} --path \"<local folder this belongs to>\""
+            )
+
+    if dry_run:
+        success(
+            f"Dry run complete. Would insert {total_headers} sessions, "
+            f"{total_composer_data} composer records, {total_bubbles} messages."
+        )
+    else:
+        success(
+            f"Sync complete. Inserted {total_headers} sessions, "
+            f"{total_composer_data} composer records, {total_bubbles} messages."
+        )
+
+
 def _cmd_import(
     *,
     cursor_user_dir: Path,
@@ -466,6 +710,21 @@ def _cmd_import(
     info(f"ItemTable keys inserted: {result.itemtable_keys_inserted}")
     info(f"cursorDiskKV keys inserted: {result.cursordiskkv_keys_inserted}")
     info(f"Composer IDs: {result.composer_ids_before} -> {result.composer_ids_after}")
+
+    if result.matched_by_name:
+        info(f"Matched by folder name (no exact path match): {len(result.matched_by_name)}")
+        for source_uri, local_uri in result.matched_by_name:
+            info(f"  {source_uri} -> {local_uri}")
+
+    if result.ambiguous_name_matches:
+        warn(
+            f"Skipped {len(result.ambiguous_name_matches)} folder name(s) with multiple "
+            "local candidates - use --path to disambiguate:"
+        )
+        for basename, candidate_uris in result.ambiguous_name_matches:
+            warn(f"  '{basename}':")
+            for uri in candidate_uris:
+                warn(f"    {uri}")
     
     if result.backup_files:
         info("Backup files created:")
