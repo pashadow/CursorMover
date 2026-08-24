@@ -19,7 +19,66 @@ from pathlib import Path
 
 from cursor_mover.locks import assert_paths_unlocked
 from cursor_mover.workspace_storage import iter_workspace_storage_entries
-from cursor_mover.workspace_uri import folder_uri_basename
+from cursor_mover.workspace_uri import folder_uri_basename, folder_uri_display_path
+
+
+@dataclass(frozen=True, slots=True)
+class SourceWorkspaceChatCount:
+    """Real chat session count for one source workspace, read straight from globalStorage.
+
+    An export JSON file cannot answer "how many real chats does this folder
+    have" - it never captures `globalStorage` (see module docstring). This
+    reads `composerHeaders` on the source machine directly instead, so the
+    counts here are authoritative.
+    """
+
+    workspace_id: str
+    folder_uri: str | None  # None for multi-root .code-workspace entries
+    workspace_config_uri: str | None
+    session_count: int
+
+    @property
+    def display_path(self) -> str:
+        if self.folder_uri:
+            return folder_uri_display_path(self.folder_uri)
+        return f"(multi-root workspace, config={self.workspace_config_uri})"
+
+
+def list_source_chat_counts(source_cursor_user_dir: Path) -> list[SourceWorkspaceChatCount]:
+    """Lists every source workspace with its real chat session count.
+
+    Includes workspaces with 0 sessions, so it answers "how many real chats
+    does each folder have" directly - unlike an export JSON's per-workspace
+    `composer.composerData` index, which is frequently 0 even for folders
+    with substantial real history (see `sync-chats` docs).
+    """
+    source_db = source_cursor_user_dir / "globalStorage" / "state.vscdb"
+    if not source_db.exists():
+        raise FileNotFoundError(f"Source globalStorage database not found: {source_db}")
+
+    con = sqlite3.connect(f"file:{source_db.as_posix()}?mode=ro", uri=True)
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT workspaceId, COUNT(*) FROM composerHeaders GROUP BY workspaceId")
+        counts_by_id = dict(cur.fetchall())
+    finally:
+        con.close()
+
+    results: list[SourceWorkspaceChatCount] = []
+    for entry in iter_workspace_storage_entries(source_cursor_user_dir):
+        if not entry.folder_uri and not entry.workspace_config_uri:
+            continue  # e.g. an "empty-window" placeholder with no real identity
+
+        results.append(
+            SourceWorkspaceChatCount(
+                workspace_id=entry.workspace_id,
+                folder_uri=entry.folder_uri,
+                workspace_config_uri=entry.workspace_config_uri,
+                session_count=counts_by_id.get(entry.workspace_id, 0),
+            )
+        )
+
+    return sorted(results, key=lambda r: r.session_count, reverse=True)
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from cursor_mover.export_import import import_workspace_chats
+from cursor_mover.export_import import list_export_workspaces, import_workspace_chats
 from cursor_mover.workspace_uri import folder_uri_basename, path_to_folder_uri
 
 
@@ -39,8 +40,8 @@ def _export_document(*, workspaces: list[dict]) -> dict:
 
 class WorkspaceUriBasenameTest(unittest.TestCase):
     def test_basename_matches_across_platforms(self) -> None:
-        windows_uri = "file:///c%3A/Users/pasha/Projects/Foo"
-        posix_uri = "file:///Users/pavlo/Documents/projects/Foo"
+        windows_uri = "file:///c%3A/Users/someuser/Projects/Foo"
+        posix_uri = "file:///Users/someuser/Documents/projects/Foo"
         self.assertEqual(folder_uri_basename(windows_uri), "Foo")
         self.assertEqual(folder_uri_basename(posix_uri), "Foo")
 
@@ -56,7 +57,7 @@ class ImportCrossMachineMatchTest(unittest.TestCase):
             local_uri = path_to_folder_uri(local_folder)
             _make_workspace_storage(cursor_user_dir, "local-id", local_uri)
 
-            windows_uri = "file:///c%3A/Users/pasha/Projects/Foo"
+            windows_uri = "file:///c%3A/Users/someuser/Projects/Foo"
             export_path = tmp_path / "export.json"
             export_path.write_text(
                 json.dumps(
@@ -106,7 +107,7 @@ class ImportCrossMachineMatchTest(unittest.TestCase):
             uri_b = path_to_folder_uri(folder_b)
             _make_workspace_storage(cursor_user_dir, "id-b", uri_b)
 
-            windows_uri = "file:///c%3A/Users/pasha/Projects/Foo"
+            windows_uri = "file:///c%3A/Users/someuser/Projects/Foo"
             export_path = tmp_path / "export.json"
             export_path.write_text(
                 json.dumps(
@@ -174,6 +175,64 @@ class ImportCrossMachineMatchTest(unittest.TestCase):
 
             self.assertEqual(result.workspaces_updated, 1)
             self.assertEqual(len(result.matched_by_name), 0)
+
+
+class ListExportWorkspacesTest(unittest.TestCase):
+    def test_lists_folder_paths_and_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp).resolve()
+            export_path = tmp_path / "export.json"
+
+            composer_data = base64.b64encode(
+                json.dumps({"allComposers": [{"composerId": "a"}, {"composerId": "b"}]}).encode("utf-8")
+            ).decode("ascii")
+            prompts = base64.b64encode(json.dumps([{"text": "hi"}, {"text": "there"}]).encode("utf-8")).decode(
+                "ascii"
+            )
+
+            export_path.write_text(
+                json.dumps(
+                    _export_document(
+                        workspaces=[
+                            {
+                                "folder_uri": "file:///c%3A/Users/someuser/Projects/Foo",
+                                "workspace_config_uri": None,
+                                "itemtable_entries": {
+                                    "composer.composerData": composer_data,
+                                    "aiService.prompts": prompts,
+                                    "other.key": base64.b64encode(b"1").decode("ascii"),
+                                },
+                                "cursordiskkv_entries": {"k": base64.b64encode(b"v").decode("ascii")},
+                                "composer_data_raw": None,
+                                "export_timestamp": "2026-01-01T00:00:00+00:00",
+                            }
+                        ]
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            source_machine, workspaces = list_export_workspaces(export_path)
+
+            self.assertEqual(source_machine, "WINDOWS-PC")
+            self.assertEqual(len(workspaces), 1)
+            ws = workspaces[0]
+            self.assertEqual(ws.folder_path, "c:/Users/someuser/Projects/Foo")
+            self.assertEqual(ws.itemtable_key_count, 3)
+            self.assertEqual(ws.cursordiskkv_key_count, 1)
+            self.assertEqual(ws.composer_session_count, 2)
+            self.assertEqual(ws.prompt_count, 2)
+
+    def test_missing_file_raises(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            list_export_workspaces(Path("/nonexistent/export.json"))
+
+    def test_wrong_format_version_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            export_path = Path(tmp) / "export.json"
+            export_path.write_text(json.dumps({"format_version": 999, "workspaces": []}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                list_export_workspaces(export_path)
 
 
 if __name__ == "__main__":

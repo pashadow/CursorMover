@@ -30,7 +30,7 @@ from cursor_mover.workspace_storage import (
     workspace_db_paths,
     WorkspaceStorageEntry,
 )
-from cursor_mover.workspace_uri import folder_uri_basename
+from cursor_mover.workspace_uri import folder_uri_basename, folder_uri_display_path
 
 
 EXPORT_FORMAT_VERSION = 1
@@ -263,6 +263,87 @@ def export_workspace_chats(
         total_composer_ids=total_composer_ids,
         export_timestamp=export_timestamp,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ExportWorkspaceInfo:
+    """Summary of one workspace entry inside an export JSON file."""
+
+    folder_uri: str
+    folder_path: str
+    itemtable_key_count: int
+    cursordiskkv_key_count: int
+    composer_session_count: int
+    prompt_count: int
+
+
+def list_export_workspaces(input_path: Path) -> tuple[str, list[ExportWorkspaceInfo]]:
+    """Reads an export JSON file and summarizes the workspaces it contains.
+
+    This is read-only and does not touch any Cursor database - it only
+    parses the export file itself, to answer "which folders are in this
+    export?" without running an actual import.
+
+    Returns:
+        Tuple of (source_machine, list of per-workspace summaries).
+
+    Raises:
+        FileNotFoundError: If the export file doesn't exist.
+        ValueError: If the export file format is invalid/unsupported.
+    """
+    input_path = input_path.resolve()
+    if not input_path.exists():
+        raise FileNotFoundError(f"Export file not found: {input_path}")
+
+    try:
+        export_document = json.loads(input_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid export file format: {e}") from e
+
+    format_version = export_document.get("format_version")
+    if format_version != EXPORT_FORMAT_VERSION:
+        raise ValueError(
+            f"Unsupported export format version: {format_version} "
+            f"(expected {EXPORT_FORMAT_VERSION})"
+        )
+
+    source_machine = export_document.get("source_machine", "unknown")
+    infos: list[ExportWorkspaceInfo] = []
+
+    for ws_data in export_document.get("workspaces", []):
+        folder_uri = ws_data.get("folder_uri") or ""
+        folder_path = folder_uri_display_path(folder_uri) if folder_uri else "(no folder - multi-root workspace)"
+
+        itemtable = ws_data.get("itemtable_entries", {})
+
+        composer_session_count = 0
+        if "composer.composerData" in itemtable:
+            try:
+                payload = json.loads(base64.b64decode(itemtable["composer.composerData"]).decode("utf-8"))
+                composer_session_count = len(payload.get("allComposers", []))
+            except Exception:
+                composer_session_count = 0
+
+        prompt_count = 0
+        if "aiService.prompts" in itemtable:
+            try:
+                prompts = json.loads(base64.b64decode(itemtable["aiService.prompts"]).decode("utf-8"))
+                prompt_count = len(prompts) if isinstance(prompts, list) else 0
+            except Exception:
+                prompt_count = 0
+
+        infos.append(
+            ExportWorkspaceInfo(
+                folder_uri=folder_uri,
+                folder_path=folder_path,
+                itemtable_key_count=len(itemtable),
+                cursordiskkv_key_count=len(ws_data.get("cursordiskkv_entries", {})),
+                composer_session_count=composer_session_count,
+                prompt_count=prompt_count,
+            )
+        )
+
+    return source_machine, infos
 
 
 def _create_timestamped_backup(file_path: Path) -> Path | None:

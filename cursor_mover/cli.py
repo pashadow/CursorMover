@@ -18,9 +18,11 @@ from cursor_mover.export_import import (
     ImportResult,
     export_workspace_chats,
     import_workspace_chats,
+    list_export_workspaces,
 )
 from cursor_mover.global_chat_merge import (
     find_orphaned_source_workspaces,
+    list_source_chat_counts,
     match_source_to_local_workspaces,
     merge_global_composer_history,
 )
@@ -130,6 +132,33 @@ def main(argv: list[str] | None = None) -> int:
             "--yes",
             action="store_true",
             help="Auto-confirm interactive prompts.",
+        )
+
+        list_export_cmd = sub.add_parser(
+            "list-export",
+            help="List the workspace folders contained in an export JSON file (READ-ONLY).",
+        )
+        list_export_cmd.add_argument(
+            "--input",
+            "-i",
+            type=Path,
+            required=True,
+            help="Input file path of the export JSON.",
+        )
+
+        list_chats_cmd = sub.add_parser(
+            "list-chats",
+            help=(
+                "List every workspace on another machine's Cursor User directory with its REAL chat "
+                "session count, read directly from globalStorage (READ-ONLY). Unlike list-export, this "
+                "requires the full Cursor User directory, not just an export JSON file - see sync-chats."
+            ),
+        )
+        list_chats_cmd.add_argument(
+            "--source-user-dir",
+            type=Path,
+            required=True,
+            help="Path to the other machine's Cursor 'User' directory (must contain globalStorage/state.vscdb).",
         )
 
         sync_chats_cmd = sub.add_parser(
@@ -278,6 +307,9 @@ def main(argv: list[str] | None = None) -> int:
                     unsafe_db=args.unsafe_db,
                 )
                 return 0
+            if args.cmd == "list-export":
+                _cmd_list_export(input_path=args.input)
+                return 0
             if args.cmd == "import":
                 _cmd_import(
                     cursor_user_dir=cursor_user_dir,
@@ -286,6 +318,9 @@ def main(argv: list[str] | None = None) -> int:
                     dry_run=args.dry_run,
                     assume_yes=args.yes,
                 )
+                return 0
+            if args.cmd == "list-chats":
+                _cmd_list_chats(source_user_dir=args.source_user_dir)
                 return 0
             if args.cmd == "sync-chats":
                 _cmd_sync_chats(
@@ -476,6 +511,48 @@ def _cmd_export(
     info(f"Total cursorDiskKV keys: {result.total_cursordiskkv_keys}")
     info(f"Total composer IDs: {result.total_composer_ids}")
     info(f"Export timestamp: {result.export_timestamp}")
+
+
+def _cmd_list_export(*, input_path: Path) -> None:
+    """List the workspace folders contained in an export JSON file (READ-ONLY)."""
+    source_machine, workspaces = list_export_workspaces(input_path)
+
+    info(f"Input file: {input_path.resolve()}")
+    info(f"Source machine: {source_machine}")
+    info(f"Workspaces: {len(workspaces)}")
+    info("")
+
+    for ws in workspaces:
+        info(ws.folder_path)
+        info(
+            f"    ItemTable keys={ws.itemtable_key_count}  cursorDiskKV keys={ws.cursordiskkv_key_count}  "
+            f"composer sessions (legacy index)={ws.composer_session_count}  prompt history={ws.prompt_count}"
+        )
+
+    info("")
+    info(
+        "Note: 'composer sessions' here is a legacy per-workspace index and is often 0 even when real "
+        "chat history exists - the actual conversations live in globalStorage, which this export file "
+        "does not contain. Use 'list-chats' (against the source machine's Cursor User directory, not "
+        "this export file) to see real per-folder session counts, and 'sync-chats' to merge them in."
+    )
+
+
+def _cmd_list_chats(*, source_user_dir: Path) -> None:
+    """List every source workspace with its real chat session count (READ-ONLY)."""
+    source_user_dir = source_user_dir.resolve()
+    counts = list_source_chat_counts(source_user_dir)
+
+    info(f"Source User dir: {source_user_dir}")
+    info(f"Workspaces: {len(counts)}")
+    info("")
+
+    for c in counts:
+        info(f"{c.session_count:5d}  {c.display_path}")
+
+    total = sum(c.session_count for c in counts)
+    info("")
+    info(f"Total real chat sessions: {total}")
 
 
 def _cmd_sync_chats(

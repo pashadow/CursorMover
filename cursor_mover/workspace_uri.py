@@ -58,6 +58,23 @@ def folder_uri_basename(folder_uri: str) -> str:
     return raw_path.rsplit("/", 1)[-1]
 
 
+def folder_uri_display_path(folder_uri: str) -> str:
+    """Returns a human-readable path for a folder URI, for display purposes only.
+
+    Unlike `folder_uri_to_path`, this never adapts to the *current* platform's
+    path conventions - it just decodes the URI's path component as-is, so a
+    Windows-style URI viewed on macOS still reads sensibly (e.g.
+    `file:///c%3A/Users/x/Foo` -> "c:/Users/x/Foo") instead of being
+    (mis)interpreted as a POSIX path.
+    """
+    parsed = urlparse(folder_uri)
+    raw_path = unquote(parsed.path)
+    if len(raw_path) >= 3 and raw_path[0] == "/" and raw_path[2] == ":":
+        # * Windows-style "/c:/Users/..." -> "c:/Users/...".
+        raw_path = raw_path[1:]
+    return raw_path
+
+
 def folder_uri_to_path(folder_uri: str) -> Path:
     """Best-effort conversion from a `file:///...` folder URI to a filesystem path.
 

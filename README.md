@@ -95,7 +95,17 @@ at most they carry your own past prompt text (`aiService.prompts`), never the re
 
 If you have direct access to the other machine's `Cursor/User` directory (e.g. you copied it onto an external
 drive, or it's on a network share), use `sync-chats` instead - it reads that directory's `globalStorage`
-directly and merges the real sessions and messages in:
+directly and merges the real sessions and messages in.
+
+To see the real chat session count per folder first, without merging anything:
+
+```bash
+python -m cursor_mover list-chats --source-user-dir "/Volumes/DRIVE/Cursor/User"
+```
+
+This is the only way to get real counts - an export JSON's per-workspace counts are not reliable (see
+`list-export` above). `list-chats` reads `globalStorage` on the source machine directly, the same way
+`sync-chats` does, so the numbers match exactly what `sync-chats` would merge.
 
 ```bash
 python -m cursor_mover sync-chats --source-user-dir "/Volumes/DRIVE/Cursor/User"
@@ -146,6 +156,19 @@ The export file includes:
 - All `ItemTable` and `cursorDiskKV` entries
 - Composer/chat metadata with timestamps
 - Export timestamp
+
+### List (READ-ONLY)
+
+See which workspace folders an export file contains, without running an import:
+
+```bash
+python -m cursor_mover list-export --input "./cursor_chats_export.json"
+```
+
+Prints each folder path plus key/session/prompt counts. Note the printed "composer sessions" count is the
+legacy per-workspace index and is frequently 0 even when a workspace has real chat history - that history
+lives in `globalStorage` on the source machine, which export files don't contain. Use `list-chats` (above,
+against the source machine's Cursor User directory, not this export file) to see real per-folder counts.
 
 ### Import (with backup)
 

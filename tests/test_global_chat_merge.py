@@ -10,6 +10,7 @@ from pathlib import Path
 
 from cursor_mover.global_chat_merge import (
     find_orphaned_source_workspaces,
+    list_source_chat_counts,
     match_source_to_local_workspaces,
     merge_global_composer_history,
 )
@@ -248,6 +249,44 @@ class MergeGlobalComposerHistoryTest(unittest.TestCase):
                 self.assertEqual(cur.fetchone()[0], 0)
             finally:
                 con.close()
+
+
+class ListSourceChatCountsTest(unittest.TestCase):
+    def test_includes_zero_count_folders_and_sorts_descending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp).resolve() / "source"
+            _make_global_storage(
+                source_root,
+                composer_headers=[
+                    ("c1", "busy-id", 100, 100, 0, 0, 0, 0, _header_value("c1", "busy-id")),
+                    ("c2", "busy-id", 100, 100, 0, 0, 0, 0, _header_value("c2", "busy-id")),
+                ],
+                disk_kv={},
+            )
+            _make_workspace_storage_entry(source_root, "busy-id", {"folder": "file:///d%3A/projects/Busy"})
+            _make_workspace_storage_entry(source_root, "quiet-id", {"folder": "file:///d%3A/projects/Quiet"})
+            _make_workspace_storage_entry(
+                source_root,
+                "multiroot-id",
+                {"workspace": "file:///c%3A/Users/someuser/AppData/Roaming/Cursor/Workspaces/1/workspace.json"},
+            )
+            _make_workspace_storage_entry(source_root, "empty-window", {})
+
+            results = list_source_chat_counts(source_root)
+
+            self.assertEqual(len(results), 3)  # empty-window excluded
+            self.assertEqual([r.session_count for r in results], [2, 0, 0])
+            self.assertEqual(results[0].workspace_id, "busy-id")
+            self.assertEqual(results[0].display_path, "d:/projects/Busy")
+
+            multiroot = next(r for r in results if r.workspace_id == "multiroot-id")
+            self.assertIsNone(multiroot.folder_uri)
+            self.assertIn("multi-root workspace", multiroot.display_path)
+
+    def test_raises_when_no_global_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(FileNotFoundError):
+                list_source_chat_counts(Path(tmp) / "nonexistent-source")
 
 
 class FindOrphanedSourceWorkspacesTest(unittest.TestCase):
